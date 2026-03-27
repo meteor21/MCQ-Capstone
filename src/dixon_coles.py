@@ -188,9 +188,15 @@ class DixonColesModel:
                 matrix[x, y] *= tau
 
         total = matrix.sum()
+        if total < 1e-10:   # degenerate matrix (extreme params) — return uniform
+            return {"home": 1/3, "draw": 1/3, "away": 1/3, "lam": lam, "mu": mu}
         home_win = float(np.tril(matrix, -1).sum()) / total
         draw = float(np.trace(matrix)) / total
         away_win = float(np.triu(matrix, 1).sum()) / total
+        # Cap at 0.95 — the model should never be this certain about a 3-outcome event
+        home_win = min(home_win, 0.95)
+        draw = min(draw, 0.95)
+        away_win = min(away_win, 0.95)
 
         return {"home": home_win, "draw": draw, "away": away_win,
                 "lam": lam, "mu": mu}
