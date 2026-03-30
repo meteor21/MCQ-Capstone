@@ -26,6 +26,11 @@ import pandas as pd
 
 from mcq_capstone.data.loader import load_or_generate
 from mcq_capstone.pre_match.dixon_coles import DixonColesModel
+from mcq_capstone.features.engineer import build_feature_matrix
+from mcq_capstone.models.goal_model import PoissonGoalModel, RidgeGoalModel
+from mcq_capstone.models.outcome_model import LogisticOutcomeModel, GradientBoostModel
+from mcq_capstone.models.market_analysis import MarketPricingModel
+from mcq_capstone.models.evaluator import walk_forward_eval, compare_models, print_comparison
 from mcq_capstone.in_play.state import MatchState
 from mcq_capstone.in_play.simulator import MonteCarloSimulator
 from mcq_capstone.markets.pricer import MarketPricer
@@ -248,6 +253,102 @@ def cmd_calibration(args):
         print(f"  Plot saved → {args.plot}")
 
 
+# ── train ──────────────────────────────────────────────────────────────────────
+
+def cmd_train(args):
+    """
+    Build feature matrix, train all models, compare them, run market analysis.
+    This is the core a priori development command.
+    """
+    df = load_or_generate(args.data)
+    print(f"Loaded {len(df)} matches.  Building feature matrix …")
+    feat_df = build_feature_matrix(df)
+    print(f"Feature matrix: {len(feat_df)} rows × {feat_df.shape[1]} columns "
+          f"({feat_df.shape[1] - 8} engineered features)")
+
+    if args.feature_matrix:
+        feat_df.to_csv(args.feature_matrix, index=False)
+        print(f"Feature matrix saved → {args.feature_matrix}")
+
+    # ── Model comparison ──────────────────────────────────────────────────────
+    print("\nRunning walk-forward model comparison …")
+    models = {
+        "PoissonGLM":   PoissonGoalModel(alpha=1.0),
+        "RidgeGoal":    RidgeGoalModel(alpha=1.0),
+        "Logistic":     LogisticOutcomeModel(C=1.0),
+        "GradientBoost": GradientBoostModel(n_estimators=100),
+    }
+    eval_results = walk_forward_eval(
+        feat_df,
+        models,
+        min_train=args.min_train,
+        train_days=args.train_days,
+        step=args.step,
+        verbose=True,
+    )
+    summary = compare_models(eval_results)
+    print_comparison(eval_results, summary)
+
+    # ── Feature importance from best linear model ─────────────────────────────
+    print("\nFitting RidgeGoal on full dataset for feature importance …")
+    ridge = RidgeGoalModel(alpha=1.0)
+    ridge.fit(feat_df)
+    fi = ridge.feature_importance()
+    print("\n  Top 20 features by |coef_home − coef_away|  (most predictive for outcome):")
+    print(fi.head(20).to_string(index=False))
+
+    # ── GradientBoost feature importance ─────────────────────────────────────
+    print("\nFitting GradientBoost for non-linear feature importance …")
+    gb = GradientBoostModel(n_estimators=200)
+    gb.fit(feat_df)
+    fi_gb = gb.feature_importance()
+    print("\n  Top 20 features (GradientBoost gain):")
+    print(fi_gb.head(20).to_string(index=False))
+
+    # ── Market pricing analysis ───────────────────────────────────────────────
+    has_odds = all(c in feat_df.columns for c in ["odds_home", "odds_draw", "odds_away"])
+    if has_odds:
+        print("\nFitting market pricing model …")
+        mpm = MarketPricingModel()
+        mpm.fit(feat_df.dropna(subset=["odds_home", "odds_draw", "odds_away"]))
+        mpm.print_report()
+    else:
+        print("\nNo odds columns — skipping market pricing analysis.")
+
+    if args.output:
+        summary.to_csv(args.output, index=False)
+        print(f"\nModel comparison saved → {args.output}")
+
+
+# ── market-analysis ────────────────────────────────────────────────────────────
+
+def cmd_market_analysis(args):
+    """
+    Deep-dive into what drives bookmaker pricing and where it deviates
+    from fundamental team statistics.
+    """
+    df = load_or_generate(args.data)
+    required = ["odds_home", "odds_draw", "odds_away"]
+    if not all(c in df.columns for c in required):
+        print("ERROR: This command requires odds columns (odds_home, odds_draw, odds_away).")
+        print("Use a real data CSV, e.g.:  --data data/sample/E0_2324.csv")
+        sys.exit(1)
+
+    print(f"Building feature matrix for {len(df)} matches …")
+    feat_df = build_feature_matrix(df)
+    feat_df = feat_df.dropna(subset=required)
+    print(f"  {len(feat_df)} matches with features + odds")
+
+    mpm = MarketPricingModel()
+    mpm.fit(feat_df)
+    mpm.print_report()
+
+    if args.output:
+        report = mpm.market_inefficiency_report(top_n=50)
+        report.to_csv(args.output, index=False)
+        print(f"\nMispricing report saved → {args.output}")
+
+
 # ── parser ─────────────────────────────────────────────────────────────────────
 
 def build_parser():
@@ -285,6 +386,19 @@ def build_parser():
     cb.add_argument("--data", default=None)
     cb.add_argument("--plot", default=None, help="Save plot to this path")
 
+    tr = sub.add_parser("train", help="Feature engineering + model comparison + market analysis")
+    tr.add_argument("--data", default=None)
+    tr.add_argument("--min-train", type=int, default=80)
+    tr.add_argument("--train-days", type=int, default=365)
+    tr.add_argument("--step", type=int, default=5,
+                    help="Evaluate every N matches (1=all, slower)")
+    tr.add_argument("--feature-matrix", default=None, help="Save feature matrix CSV")
+    tr.add_argument("--output", default=None, help="Save model comparison CSV")
+
+    ma = sub.add_parser("market-analysis", help="Reverse-engineer bookmaker pricing")
+    ma.add_argument("--data", default=None)
+    ma.add_argument("--output", default=None, help="Save mispricing report CSV")
+
     return p
 
 
@@ -299,6 +413,8 @@ def main():
         "simulate": cmd_simulate,
         "ratings": cmd_ratings,
         "calibration": cmd_calibration,
+        "train": cmd_train,
+        "market-analysis": cmd_market_analysis,
     }[args.command](args)
 
 
