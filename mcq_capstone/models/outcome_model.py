@@ -64,7 +64,7 @@ class LogisticOutcomeModel:
             ("impute", SimpleImputer(strategy="median")),
             ("scale",  StandardScaler()),
             ("model",  LogisticRegression(
-                C=self.C, multi_class="multinomial",
+                C=self.C,
                 solver="lbfgs", max_iter=self.max_iter,
             )),
         ])

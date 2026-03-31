@@ -29,8 +29,13 @@ from mcq_capstone.pre_match.dixon_coles import DixonColesModel
 from mcq_capstone.features.engineer import build_feature_matrix
 from mcq_capstone.models.goal_model import PoissonGoalModel, RidgeGoalModel
 from mcq_capstone.models.outcome_model import LogisticOutcomeModel, GradientBoostModel
+from mcq_capstone.models.extended_models import ElasticNetGoalModel, NegBinGoalModel, StackingEnsemble
 from mcq_capstone.models.market_analysis import MarketPricingModel
 from mcq_capstone.models.evaluator import walk_forward_eval, compare_models, print_comparison
+from mcq_capstone.models.splitter import TemporalSplitter
+from mcq_capstone.models.leakage_audit import audit_features
+from mcq_capstone.models.tuner import HyperparameterTuner, tune_all_models, PARAM_GRIDS
+from mcq_capstone.pipeline import DeployablePipeline, MultiLeaguePipeline
 from mcq_capstone.in_play.state import MatchState
 from mcq_capstone.in_play.simulator import MonteCarloSimulator
 from mcq_capstone.markets.pricer import MarketPricer
@@ -320,6 +325,177 @@ def cmd_train(args):
         print(f"\nModel comparison saved → {args.output}")
 
 
+# ── tune ───────────────────────────────────────────────────────────────────────
+
+def cmd_tune(args):
+    """
+    Hyperparameter tuning using TimeSeriesSplit CV on train+val only.
+    Reports best params per model family and saves a summary CSV.
+    """
+    df = load_or_generate(args.data)
+    print(f"Loaded {len(df)} matches. Building feature matrix …")
+    feat_df = build_feature_matrix(df)
+    print(f"Feature matrix: {len(feat_df)} rows × {feat_df.shape[1]} columns")
+
+    # Leakage audit first
+    print("\nRunning leakage audit …")
+    audit_features(feat_df, verbose=True)
+
+    # Temporal split — tuning only on train+val
+    splitter = TemporalSplitter(test_months=4, val_months=3)
+    split = splitter.split(feat_df)
+    splitter.print_split_info(feat_df)
+
+    import numpy as np
+    train_val_df = feat_df.iloc[
+        np.concatenate([split.train_idx, split.val_idx])
+    ].reset_index(drop=True)
+
+    print(f"\nTuning on {len(train_val_df)} rows (train+val). "
+          f"Test set ({len(split.test_idx)} rows) is LOCKED.")
+
+    # Select which models to tune
+    model_map = {
+        "logistic":   (LogisticOutcomeModel, None),
+        "gbm":        (GradientBoostModel,   None),
+        "poisson":    (PoissonGoalModel,      None),
+        "ridge":      (RidgeGoalModel,        None),
+        "elasticnet": (ElasticNetGoalModel,   None),
+        "negbin":     (NegBinGoalModel,       None),
+    }
+    if args.models:
+        selected = [(model_map[m][0], model_map[m][1])
+                    for m in args.models.split(",") if m in model_map]
+    else:
+        # Default: fast models only unless --all
+        if args.all_models:
+            selected = list(model_map.values())
+        else:
+            selected = [
+                (LogisticOutcomeModel, None),
+                (PoissonGoalModel,     None),
+                (RidgeGoalModel,       None),
+                (ElasticNetGoalModel,  None),
+            ]
+
+    tuner = HyperparameterTuner(n_cv_folds=args.cv_folds, verbose=True)
+    all_results = {}
+    for cls, grid in selected:
+        try:
+            res = tuner.tune(cls, train_val_df, param_grid=grid)
+            all_results[cls.__name__] = res
+        except Exception as e:
+            print(f"  ERROR tuning {cls.__name__}: {e}")
+
+    # Summary table
+    print(f"\n{'='*70}")
+    print("  TUNING SUMMARY")
+    print(f"{'='*70}")
+    rows = []
+    for name, res in all_results.items():
+        rows.append({
+            "model":       name,
+            "best_brier":  res.best_brier,
+            "best_logloss": res.best_log_loss,
+            "best_params": str(res.best_params),
+        })
+    if rows:
+        summary_df = pd.DataFrame(rows).sort_values("best_brier")
+        print(summary_df.to_string(index=False))
+
+    if args.output and rows:
+        summary_df.to_csv(args.output, index=False)
+        print(f"\nTuning summary saved → {args.output}")
+
+
+# ── build-pipeline ─────────────────────────────────────────────────────────────
+
+def cmd_build_pipeline(args):
+    """
+    Build, validate, and serialise a deployable prediction pipeline.
+
+    Steps:
+      1. Load data + engineer features
+      2. Leakage audit
+      3. Temporal train/val/test split
+      4. (Optionally) tune hyperparameters on train+val
+      5. Fit best model on train+val
+      6. Final evaluation on locked test set
+      7. Save pipeline to disk
+    """
+    df = load_or_generate(args.data)
+    print(f"Loaded {len(df)} matches.")
+
+    tune_params = None
+    if args.tune:
+        print("\nRunning hyperparameter tuning first …")
+        feat_df = build_feature_matrix(df)
+        splitter = TemporalSplitter(test_months=4, val_months=3)
+        split = splitter.split(feat_df)
+        import numpy as np
+        train_val_df = feat_df.iloc[
+            np.concatenate([split.train_idx, split.val_idx])
+        ].reset_index(drop=True)
+
+        model_cls_map = {
+            "GradientBoostModel":   GradientBoostModel,
+            "LogisticOutcomeModel": LogisticOutcomeModel,
+            "PoissonGoalModel":     PoissonGoalModel,
+            "RidgeGoalModel":       RidgeGoalModel,
+            "ElasticNetGoalModel":  ElasticNetGoalModel,
+            "NegBinGoalModel":      NegBinGoalModel,
+        }
+        model_cls = model_cls_map.get(args.model, GradientBoostModel)
+        tuner = HyperparameterTuner(n_cv_folds=5, verbose=True)
+        try:
+            res = tuner.tune(model_cls, train_val_df)
+            tune_params = res.best_params
+            print(f"\nBest params: {tune_params}")
+        except Exception as e:
+            print(f"Tuning failed ({e}), using defaults.")
+
+    pipeline = DeployablePipeline.build_and_fit(
+        raw_df=df,
+        league=args.league or "unknown",
+        model_type=args.model,
+        model_params=tune_params,
+        test_holdout_months=4,
+        verbose=True,
+    )
+
+    save_path = args.output or f"models/{args.league or 'model'}_pipeline.pkl"
+    pipeline.save(save_path)
+    print(pipeline.summary())
+
+
+# ── deploy ─────────────────────────────────────────────────────────────────────
+
+def cmd_deploy(args):
+    """
+    Load a saved pipeline and predict bets for upcoming fixtures.
+    """
+    pipeline = DeployablePipeline.load(args.pipeline)
+
+    if args.fixtures:
+        fixtures_df = pd.read_csv(args.fixtures, parse_dates=["date"])
+    else:
+        # Fall back to loading historical data (pipeline will use last matches
+        # as context and filter to upcoming)
+        fixtures_df = load_or_generate(args.data)
+
+    bets = pipeline.predict_bets(
+        fixtures_df,
+        bankroll=args.bankroll,
+        verbose=True,
+    )
+
+    if args.output and bets:
+        import dataclasses
+        bet_rows = [dataclasses.asdict(b) for b in bets]
+        pd.DataFrame(bet_rows).to_csv(args.output, index=False)
+        print(f"Bet recommendations saved → {args.output}")
+
+
 # ── market-analysis ────────────────────────────────────────────────────────────
 
 def cmd_market_analysis(args):
@@ -399,6 +575,37 @@ def build_parser():
     ma.add_argument("--data", default=None)
     ma.add_argument("--output", default=None, help="Save mispricing report CSV")
 
+    tn = sub.add_parser("tune", help="Hyperparameter tuning with TimeSeriesSplit CV")
+    tn.add_argument("--data", default=None)
+    tn.add_argument("--models", default=None,
+                    help="Comma-separated: logistic,gbm,poisson,ridge,elasticnet,negbin")
+    tn.add_argument("--all-models", action="store_true",
+                    help="Tune all model families (slow)")
+    tn.add_argument("--cv-folds", type=int, default=5)
+    tn.add_argument("--output", default=None, help="Save tuning summary CSV")
+
+    bp = sub.add_parser("build-pipeline",
+                        help="Build + validate + serialise a deployable pipeline")
+    bp.add_argument("--data", default=None)
+    bp.add_argument("--league", default="E0")
+    bp.add_argument("--model", default="GradientBoostModel",
+                    choices=["GradientBoostModel", "LogisticOutcomeModel",
+                             "PoissonGoalModel", "RidgeGoalModel",
+                             "ElasticNetGoalModel", "NegBinGoalModel",
+                             "StackingEnsemble"])
+    bp.add_argument("--tune", action="store_true",
+                    help="Run hyperparameter tuning before fitting")
+    bp.add_argument("--output", default=None, help="Path to save .pkl pipeline")
+
+    dp = sub.add_parser("deploy", help="Load saved pipeline + predict bets")
+    dp.add_argument("--pipeline", required=True, help="Path to .pkl pipeline file")
+    dp.add_argument("--fixtures", default=None,
+                    help="CSV of upcoming fixtures with odds columns")
+    dp.add_argument("--data", default=None,
+                    help="Historical data CSV (used if --fixtures not provided)")
+    dp.add_argument("--bankroll", type=float, default=1000.0)
+    dp.add_argument("--output", default=None, help="Save bet recommendations CSV")
+
     return p
 
 
@@ -406,15 +613,18 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     {
-        "download": cmd_download,
-        "backtest": cmd_backtest,
-        "multi-backtest": cmd_multi_backtest,
-        "predict": cmd_predict,
-        "simulate": cmd_simulate,
-        "ratings": cmd_ratings,
-        "calibration": cmd_calibration,
-        "train": cmd_train,
+        "download":        cmd_download,
+        "backtest":        cmd_backtest,
+        "multi-backtest":  cmd_multi_backtest,
+        "predict":         cmd_predict,
+        "simulate":        cmd_simulate,
+        "ratings":         cmd_ratings,
+        "calibration":     cmd_calibration,
+        "train":           cmd_train,
         "market-analysis": cmd_market_analysis,
+        "tune":            cmd_tune,
+        "build-pipeline":  cmd_build_pipeline,
+        "deploy":          cmd_deploy,
     }[args.command](args)
 
 
