@@ -11,6 +11,8 @@ Commands
   simulate         Show probability evolution over match time
   ratings          Team attack/defense ratings
   calibration      Show calibration report for a league
+  fbref-download   Download FBRef match data (requires sports-reference subscription)
+  fbref-team       Download a specific team's full match log from FBRef
 """
 
 from __future__ import annotations
@@ -36,6 +38,10 @@ from mcq_capstone.models.splitter import TemporalSplitter
 from mcq_capstone.models.leakage_audit import audit_features
 from mcq_capstone.models.tuner import HyperparameterTuner, tune_all_models, PARAM_GRIDS
 from mcq_capstone.pipeline import DeployablePipeline, MultiLeaguePipeline
+from mcq_capstone.data.fbref import (
+    FBRefScraper, COMPETITIONS, FDCO_TO_FBREF,
+    download_fbref_seasons, combine_fbref_data, build_xg_features,
+)
 from mcq_capstone.in_play.state import MatchState
 from mcq_capstone.in_play.simulator import MonteCarloSimulator
 from mcq_capstone.markets.pricer import MarketPricer
@@ -525,6 +531,137 @@ def cmd_market_analysis(args):
         print(f"\nMispricing report saved → {args.output}")
 
 
+# ── fbref-download ─────────────────────────────────────────────────────────────
+
+def cmd_fbref_download(args):
+    """
+    Download FBRef match schedules for multiple leagues and seasons.
+
+    With your sports-reference.com subscription:
+      - Pass --username and --password to get subscriber rate limits (~2s/req)
+      - Results cached to --cache-dir to avoid re-downloading
+
+    Example
+    -------
+    python -m mcq_capstone.cli.main fbref-download \\
+        --leagues ENG-PL ESP-LL GER-BL ITA-SA FRA-L1 NED-ED POR-PL TUR-SL \\
+                  UEFA-CL UEFA-EL UEFA-ECL \\
+        --seasons 2022-23 2023-24 2024-25 \\
+        --username your@email.com --password yourpass \\
+        --output data/fbref/all_leagues.csv
+    """
+    leagues  = args.leagues or list(COMPETITIONS.keys())
+    seasons  = args.seasons or ["2022-23", "2023-24", "2024-25"]
+    delay    = 2.0 if (args.username and args.password) else 4.0
+
+    print(f"Downloading FBRef data:")
+    print(f"  Leagues  : {', '.join(leagues)}")
+    print(f"  Seasons  : {', '.join(seasons)}")
+    print(f"  Delay    : {delay}s per request")
+    print(f"  Cache dir: {args.cache_dir}")
+
+    data = download_fbref_seasons(
+        leagues=leagues,
+        seasons=seasons,
+        cache_dir=args.cache_dir,
+        delay=delay,
+        verbose=True,
+    )
+
+    combined = combine_fbref_data(data, include_upcoming=args.include_upcoming)
+    print(f"\nCombined: {len(combined)} completed matches across "
+          f"{combined['league'].nunique() if 'league' in combined.columns else '?'} leagues")
+
+    if "xg_home" in combined.columns:
+        xg_avail = combined["xg_home"].notna().mean()
+        print(f"xG data available: {xg_avail:.0%} of matches")
+
+    if args.output:
+        import os
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        combined.to_csv(args.output, index=False)
+        print(f"Saved → {args.output}")
+    else:
+        print("\nSample output:")
+        print(combined.head(10).to_string())
+
+    # Per-league summary
+    if "league" in combined.columns:
+        print("\nPer-league match counts:")
+        summary = (
+            combined.groupby("league")
+            .agg(
+                matches=("date", "count"),
+                date_from=("date", "min"),
+                date_to=("date", "max"),
+            )
+            .sort_values("matches", ascending=False)
+        )
+        print(summary.to_string())
+
+
+def cmd_fbref_team(args):
+    """
+    Download per-match stats for a specific team from FBRef.
+
+    The team_id is found in any FBRef team URL, e.g.:
+      fbref.com/en/squads/ecd11ca2/Galatasaray-Stats
+      → team_id = ecd11ca2
+
+    Example
+    -------
+    python -m mcq_capstone.cli.main fbref-team \\
+        --team-id ecd11ca2 --team-name Galatasaray \\
+        --season 2024-25 \\
+        --username your@email.com --password yourpass \\
+        --output data/fbref/galatasaray_2024.csv
+    """
+    delay = 2.0 if (args.username and args.password) else 4.0
+    scraper = FBRefScraper(
+        delay=delay,
+        cache_dir=args.cache_dir,
+        sr_username=args.username,
+        sr_password=args.password,
+    )
+
+    seasons = args.seasons or [args.season or "2024-25"]
+    all_logs = []
+
+    for season in seasons:
+        try:
+            print(f"  Fetching {args.team_name} ({args.team_id}) — {season} … ", end="", flush=True)
+            df = scraper.load_team_match_log(
+                team_id=args.team_id,
+                team_name=args.team_name,
+                season=season,
+                comp_filter=args.comp_filter,
+            )
+            df["season"] = season
+            all_logs.append(df)
+            print(f"OK ({len(df)} matches)")
+        except Exception as e:
+            print(f"SKIP ({e})")
+
+    if not all_logs:
+        print("No data retrieved.")
+        return
+
+    combined = pd.concat(all_logs, ignore_index=True)
+    print(f"\nTotal: {len(combined)} match records")
+
+    cols_to_show = [c for c in ["date", "competition", "venue", "opponent",
+                                 "result", "goals_for", "goals_against",
+                                 "xg_for", "xg_against", "possession",
+                                 "shots", "shots_on_target"] if c in combined.columns]
+    print(combined[cols_to_show].head(10).to_string(index=False))
+
+    if args.output:
+        import os
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        combined.to_csv(args.output, index=False)
+        print(f"\nSaved → {args.output}")
+
+
 # ── parser ─────────────────────────────────────────────────────────────────────
 
 def build_parser():
@@ -606,6 +743,49 @@ def build_parser():
     dp.add_argument("--bankroll", type=float, default=1000.0)
     dp.add_argument("--output", default=None, help="Save bet recommendations CSV")
 
+    fd = sub.add_parser(
+        "fbref-download",
+        help="Download FBRef match data for multiple leagues/seasons",
+    )
+    fd.add_argument(
+        "--leagues", nargs="+", default=None,
+        metavar="LEAGUE",
+        help=(
+            "League codes: ENG-PL ESP-LL GER-BL ITA-SA FRA-L1 NED-ED POR-PL "
+            "TUR-SL BEL-PD SCO-PL UEFA-CL UEFA-EL UEFA-ECL"
+        ),
+    )
+    fd.add_argument(
+        "--seasons", nargs="+", default=None,
+        metavar="SEASON",
+        help="Season strings e.g. 2022-23 2023-24 2024-25",
+    )
+    fd.add_argument("--username", default=None, help="sports-reference.com email")
+    fd.add_argument("--password", default=None, help="sports-reference.com password")
+    fd.add_argument("--cache-dir", default="data/fbref_cache",
+                    help="Directory to cache downloaded HTML (default: data/fbref_cache)")
+    fd.add_argument("--output", default=None, help="Save combined CSV to this path")
+    fd.add_argument("--include-upcoming", action="store_true",
+                    help="Include upcoming fixtures (no score yet)")
+
+    ft = sub.add_parser(
+        "fbref-team",
+        help="Download full match log for a specific team from FBRef",
+    )
+    ft.add_argument("--team-id",   required=True,
+                    help="FBRef team ID from URL (e.g. ecd11ca2 for Galatasaray)")
+    ft.add_argument("--team-name", required=True,
+                    help="Team name (e.g. 'Galatasaray')")
+    ft.add_argument("--season",    default="2024-25")
+    ft.add_argument("--seasons",   nargs="+", default=None,
+                    help="Multiple seasons (overrides --season)")
+    ft.add_argument("--comp-filter", default=None,
+                    help="Filter to competition name substring (e.g. 'Champions')")
+    ft.add_argument("--username",  default=None)
+    ft.add_argument("--password",  default=None)
+    ft.add_argument("--cache-dir", default="data/fbref_cache")
+    ft.add_argument("--output",    default=None)
+
     return p
 
 
@@ -625,6 +805,8 @@ def main():
         "tune":            cmd_tune,
         "build-pipeline":  cmd_build_pipeline,
         "deploy":          cmd_deploy,
+        "fbref-download":  cmd_fbref_download,
+        "fbref-team":      cmd_fbref_team,
     }[args.command](args)
 
 
