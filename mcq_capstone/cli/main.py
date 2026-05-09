@@ -42,6 +42,11 @@ from mcq_capstone.data.fbref import (
     FBRefScraper, COMPETITIONS, FDCO_TO_FBREF,
     download_fbref_seasons, combine_fbref_data, build_xg_features,
 )
+from mcq_capstone.data.statsbomb import StatsBombLoader, GOOD_COMPETITIONS
+from mcq_capstone.data.parquet_store import (
+    download_fdco_results, build_and_save_features,
+    parquet_summary, FDCO_LEAGUES,
+)
 from mcq_capstone.in_play.state import MatchState
 from mcq_capstone.in_play.simulator import MonteCarloSimulator
 from mcq_capstone.markets.pricer import MarketPricer
@@ -662,6 +667,84 @@ def cmd_fbref_team(args):
         print(f"\nSaved → {args.output}")
 
 
+# ── fetch-data ─────────────────────────────────────────────────────────────────
+
+def cmd_fetch_data(args):
+    """
+    Master data fetch: downloads everything and saves as parquet files.
+
+    Sources
+    -------
+    1. StatsBomb Open Data (free, no auth) — event-level match data:
+         matches.parquet   goal/card/sub events with exact minute
+         events.parquet    every key event with scoreline context
+         shots.parquet     every shot with xG, location, body part
+
+    2. football-data.co.uk (free CSVs) — results + odds:
+         results.parquet   16 leagues × 7 seasons, match stats + B365 odds
+
+    3. Feature matrix built from results.parquet:
+         features.parquet  82 engineered features per match
+
+    Output directory: --out-dir (default: data/parquet)
+    """
+    import os
+    out = args.out_dir
+    os.makedirs(out, exist_ok=True)
+
+    # ── Step 1: StatsBomb event data ────────────────────────────────────────
+    if not args.skip_statsbomb:
+        print("\n" + "="*60)
+        print("  STEP 1 / 3 — StatsBomb Open Data (event-level)")
+        print("="*60)
+        comp_ids = None
+        if args.statsbomb_comps:
+            comp_ids = [int(c) for c in args.statsbomb_comps]
+        loader = StatsBombLoader(
+            out_dir=out,
+            min_matches=args.min_matches,
+            competitions=comp_ids,
+            delay=0.3,
+        )
+        loader.download_all(verbose=True)
+
+    # ── Step 2: football-data.co.uk results ────────────────────────────────
+    if not args.skip_fdco:
+        print("\n" + "="*60)
+        print("  STEP 2 / 3 — football-data.co.uk Results + Odds")
+        print("="*60)
+        leagues = args.fdco_leagues or list(FDCO_LEAGUES.keys())
+        seasons = args.fdco_seasons or ["1920", "2021", "2122", "2223", "2324"]
+        results_df = download_fdco_results(
+            leagues=leagues, seasons=seasons,
+            out_dir=out, verbose=True,
+        )
+    else:
+        import os
+        rpath = os.path.join(out, "results.parquet")
+        results_df = pd.read_parquet(rpath) if os.path.exists(rpath) else pd.DataFrame()
+
+    # ── Step 3: Feature engineering ─────────────────────────────────────────
+    if not args.skip_features and not results_df.empty:
+        print("\n" + "="*60)
+        print("  STEP 3 / 3 — Feature Engineering")
+        print("="*60)
+        build_and_save_features(results_df, out_dir=out, verbose=True)
+
+    # ── Summary ─────────────────────────────────────────────────────────────
+    print()
+    parquet_summary(out)
+    print(f"\nAll parquet files ready in: {out}")
+    print("Load with:  pd.read_parquet('data/parquet/events.parquet')")
+
+
+# ── parquet-info ────────────────────────────────────────────────────────────────
+
+def cmd_parquet_info(args):
+    """Show a summary of all parquet files in the data store."""
+    parquet_summary(args.out_dir)
+
+
 # ── parser ─────────────────────────────────────────────────────────────────────
 
 def build_parser():
@@ -786,6 +869,34 @@ def build_parser():
     ft.add_argument("--cache-dir", default="data/fbref_cache")
     ft.add_argument("--output",    default=None)
 
+    fd2 = sub.add_parser(
+        "fetch-data",
+        help="Download ALL free data (StatsBomb events + FDCO results) → parquet files",
+    )
+    fd2.add_argument("--out-dir", default="data/parquet",
+                     help="Output directory for parquet files (default: data/parquet)")
+    fd2.add_argument("--skip-statsbomb", action="store_true",
+                     help="Skip StatsBomb event data download")
+    fd2.add_argument("--skip-fdco", action="store_true",
+                     help="Skip football-data.co.uk results download")
+    fd2.add_argument("--skip-features", action="store_true",
+                     help="Skip feature engineering step")
+    fd2.add_argument("--min-matches", type=int, default=10,
+                     help="Skip StatsBomb competition-seasons with fewer matches (default 10)")
+    fd2.add_argument("--statsbomb-comps", nargs="+", default=None, metavar="ID",
+                     help="StatsBomb competition IDs to include (default: all major ones)")
+    fd2.add_argument(
+        "--fdco-leagues", nargs="+", default=None, metavar="CODE",
+        help="football-data.co.uk codes: E0 SP1 D1 I1 F1 N1 P1 T1 G1 B1 SC0 …",
+    )
+    fd2.add_argument(
+        "--fdco-seasons", nargs="+", default=None, metavar="SEASON",
+        help="Season codes like 2122 2223 2324 (default: last 5 seasons)",
+    )
+
+    pi = sub.add_parser("parquet-info", help="Show summary of saved parquet files")
+    pi.add_argument("--out-dir", default="data/parquet")
+
     return p
 
 
@@ -807,6 +918,8 @@ def main():
         "deploy":          cmd_deploy,
         "fbref-download":  cmd_fbref_download,
         "fbref-team":      cmd_fbref_team,
+        "fetch-data":      cmd_fetch_data,
+        "parquet-info":    cmd_parquet_info,
     }[args.command](args)
 
 
